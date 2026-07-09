@@ -2,10 +2,10 @@ name: Advance Bookings Update
 
 on:
   schedule:
-    # Runs at 10:00, 16:00, 20:00, 23:00 IST daily
-    # UTC times: 04:30, 10:30, 14:30, 17:30
-    - cron: '30 4,10,14,17 * * *'
-  workflow_dispatch:   # manual trigger
+    # Runs at 10:00, 16:00, 20:00, 23:00 Bangladesh Time (UTC+6)
+    # -> UTC: 04:00, 10:00, 14:00, 17:00
+    - cron: '0 4,10,14,17 * * *'
+  workflow_dispatch:
 
 jobs:
   fetch:
@@ -28,10 +28,32 @@ jobs:
       - name: Run Advance script
         run: python advance.py
 
-      - name: Commit and push updated JSONs
+      - name: Commit and push updated JSONs (with retry + force)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add advance/
-          git diff --staged --quiet || git commit -m "Update advance bookings data [skip ci]"
-          git push
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update advance bookings data [skip ci]"
+
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+            echo "Push attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
+            git pull --rebase --quiet || true
+            if git push --force-with-lease; then
+              echo "Push succeeded!"
+              exit 0
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            sleep 5
+          done
+
+          echo "Push failed after $MAX_RETRIES attempts."
+          exit 1
