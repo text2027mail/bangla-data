@@ -26,23 +26,23 @@ jobs:
       - name: Run Box Office script
         run: python boxoffice.py
 
-      - name: Commit and push updated JSON (with retry + force)
+      - name: Commit and push updated JSONs (with retry + force)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage changes
-          git add boxoffice/
+          # Stage both boxoffice daily files AND movie database
+          git add boxoffice/ movie/
 
-          # Only commit if there are changes
+          # Only commit if there are changes in either folder
           if git diff --staged --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Update boxoffice data [skip ci]"
+          git commit -m "Update boxoffice and movie data [skip ci]"
 
-          # Retry push with rebase and force-with-lease
+          # Retry push with rebase and safe force
           MAX_RETRIES=3
           RETRY_COUNT=0
           until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
