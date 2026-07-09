@@ -3,6 +3,8 @@
 Advance Bookings Script – Fetches seat data for the next 6 days (excluding today).
 Rewrites the entire JSON for each date independently.
 Saves to: /advance/YYYY/MM-DD.json (minified, value-only arrays).
+
+Each daily file includes a top-level "data" object and a "last_updated" timestamp (IST).
 """
 
 import asyncio
@@ -36,6 +38,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 ]
 
+# Timezone: Indian Standard Time (UTC+5:30) for last_updated
 IST = pytz.timezone("Asia/Kolkata")
 
 # ========== HELPERS ==========
@@ -50,6 +53,10 @@ def generate_user_id(length: int = 33) -> str:
 
 def ist_now() -> datetime:
     return datetime.now(IST)
+
+def get_ist_timestamp() -> str:
+    """Return current IST time as 'YYYY-MM-DD HH:MM IST'."""
+    return ist_now().strftime("%Y-%m-%d %H:%M IST")
 
 def get_ist_date_str() -> str:
     return ist_now().strftime("%Y-%m-%d")
@@ -66,6 +73,7 @@ def get_path_for_date(date_str: str) -> str:
     os.makedirs(dir_path, exist_ok=True)
     return os.path.join(dir_path, f"{month}-{day}.json")
 
+# Global device key (fixed per run)
 GLOBAL_DEVICE_KEY = generate_device_key()
 
 # ========== LOGIN & HEADERS ==========
@@ -231,10 +239,15 @@ async def main():
                 continue
 
             filepath = get_path_for_date(date_str)
+            # Build the output structure with timestamp
+            output = {
+                "data": data,
+                "last_updated": get_ist_timestamp()
+            }
             # Write fresh (rewrite entire file)
             with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
-            print(f"💾 Saved {filepath}")
+                json.dump(output, f, separators=(',', ':'), ensure_ascii=False)
+            print(f"💾 Saved {filepath} (last_updated: {output['last_updated']})")
 
 if __name__ == "__main__":
     asyncio.run(main())
