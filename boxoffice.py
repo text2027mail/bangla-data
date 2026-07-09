@@ -5,8 +5,9 @@ Updates existing JSON file by matching programId (append/update).
 Saves to: /boxoffice/YYYY/MM-DD.json (minified, value-only arrays).
 
 Also builds/updates a movie‑level database:
-- movie/data/{slug}.json – day‑wise aggregated stats per movie
-- movie/index.json – master index of all movies with lifetime totals
+- movie/data/{slug}.json – day‑wise aggregated stats per movie (no gross)
+- movie/index.json – master index of all movies with lifetime totals & dates,
+  including "d" = number of days between first and last date (inclusive).
 
 Each daily file and the index include a "last_updated" timestamp (IST).
 """
@@ -18,7 +19,7 @@ import string
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple, Any
 import pytz
@@ -29,7 +30,7 @@ SHOW_URL = "https://cineplex-web-api.cineplexbd.com/api/v1/movie-show-time"
 SEAT_URL = "https://cineplex-ticket-api.cineplexbd.com/api/v1/get-seat"
 
 SEAT_AUTH = "Bearer 175714|CINE-TICKET-1OgNEfYvrMNAQRnQwVUkiGVUhG88hh5dsE9AKbHM30ee001b"
-AVG_PRICE = 500  # used for gross calculations
+AVG_PRICE = 500  # kept for possible future use, but not stored
 
 LOCATIONS = [1, 2, 3, 4, 5, 6, 8, 9, 10]
 
@@ -64,6 +65,9 @@ def bst_now() -> datetime:
 def get_bst_date_str() -> str:
     return bst_now().strftime("%Y-%m-%d")
 
+def get_bst_yyyymmdd() -> str:
+    return bst_now().strftime("%Y%m%d")
+
 def get_bst_year_month_day() -> Tuple[str, str, str]:
     now = bst_now()
     return now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
@@ -80,6 +84,17 @@ def slugify(title: str) -> str:
     slug = re.sub(r'[^a-zA-Z0-9\s]', '', title).strip().lower()
     slug = re.sub(r'\s+', '-', slug)
     return slug
+
+def date_to_datetime(date_int: int) -> datetime:
+    """Convert YYYYMMDD integer to datetime."""
+    s = str(date_int)
+    return datetime.strptime(s, "%Y%m%d")
+
+def days_between_inclusive(first: int, last: int) -> int:
+    """Return number of days from first to last inclusive."""
+    d1 = date_to_datetime(first)
+    d2 = date_to_datetime(last)
+    return (d2 - d1).days + 1
 
 # Global device key (fixed per run)
 GLOBAL_DEVICE_KEY = generate_device_key()
@@ -249,10 +264,8 @@ def load_existing_data(filepath: str) -> Dict[str, List[List[Any]]]:
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = json.load(f)
-        # If it's a dict with a "data" key, extract it
         if isinstance(content, dict) and "data" in content:
             return content["data"]
-        # Otherwise assume it's the old format (direct movie->entries)
         return content
     except:
         return {}
@@ -262,7 +275,6 @@ def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
        then save with a top-level "data" and "last_updated" (IST)."""
     existing = load_existing_data(filepath)
 
-    # Merge new_data into existing
     for movie, entries in new_data.items():
         if movie not in existing:
             existing[movie] = []
@@ -272,7 +284,6 @@ def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
             existing_map[pid] = entry
         existing[movie] = list(existing_map.values())
 
-    # Build the final structure with timestamp
     output = {
         "data": existing,
         "last_updated": get_ist_timestamp()
@@ -282,12 +293,16 @@ def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
         json.dump(output, f, separators=(',', ':'), ensure_ascii=False)
     print(f"💾 Updated {filepath} (last_updated: {output['last_updated']})")
 
-# ========== MOVIE DATABASE BUILDER ==========
+# ========== MOVIE DATABASE BUILDER (UPDATED) ==========
 def update_movie_database():
     """
     Scan all daily JSON files under boxoffice/, aggregate per movie per date,
     and write per‑movie summary files + an index.
-    The index now includes a "last_updated" field.
+    New format:
+      - index: per movie => name, slug, totalTickets, totalShows, totalSeats,
+                firstDate, lastDate, currentDate, and d (days inclusive between first and last)
+      - per-movie: each day => [date (YYYYMMDD), tickets, shows, seats, venueCount]
+    All gross fields are removed.
     """
     print("\n📊 Building movie database...")
     base_dir = "boxoffice"
@@ -295,7 +310,6 @@ def update_movie_database():
         print("⚠️ No boxoffice data found.")
         return
 
-    # Collect all daily files: boxoffice/YYYY/MM-DD.json
     daily_files = []
     for year_dir in os.listdir(base_dir):
         year_path = os.path.join(base_dir, year_dir)
@@ -317,14 +331,13 @@ def update_movie_database():
         "shows": 0,
         "seats": 0,
         "sold": 0,
-        "venues": set()   # will convert to count later
+        "venues": set()
     }))
 
     for date_str, filepath in daily_files:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = json.load(f)
-            # Extract data: new format has "data" key; old is direct
             if isinstance(content, dict) and "data" in content:
                 data = content["data"]
             else:
@@ -343,28 +356,38 @@ def update_movie_database():
             agg["sold"] += sold
             agg["venues"].update(venues)
 
-    # Now write per‑movie files and build index
+    # Today's date in YYYYMMDD for the 'currentDate' field
+    today_yyyymmdd = int(get_bst_yyyymmdd())
+
     os.makedirs("movie/data", exist_ok=True)
     index = []
 
     for movie, dates in movie_agg.items():
         slug = slugify(movie)
         day_rows = []
-        total_gross = 0
         total_tickets = 0
+        total_shows = 0
+        total_seats = 0
+        first_date = None
+        last_date = None
 
         for date_str, stats in sorted(dates.items()):
-            gross = stats["sold"] * AVG_PRICE
-            total_gross += gross
-            total_tickets += stats["sold"]
-            venues_count = len(stats["venues"])
-            day_rows.append([
-                int(date_str),
-                gross,
-                stats["shows"],
-                stats["seats"],
-                venues_count
-            ])
+            date_int = int(date_str)
+            if first_date is None:
+                first_date = date_int
+            last_date = date_int
+
+            sold = stats["sold"]
+            shows = stats["shows"]
+            seats = stats["seats"]
+            venues = len(stats["venues"])
+
+            total_tickets += sold
+            total_shows += shows
+            total_seats += seats
+
+            # Per-day entry: [date, tickets, shows, seats, venueCount]
+            day_rows.append([date_int, sold, shows, seats, venues])
 
         # Write per‑movie file
         movie_file = os.path.join("movie/data", f"{slug}.json")
@@ -372,11 +395,23 @@ def update_movie_database():
             json.dump(day_rows, f, separators=(',', ':'), ensure_ascii=False)
         print(f"   📄 {movie_file}")
 
+        # Compute d = days between first and last (inclusive)
+        if first_date is not None and last_date is not None:
+            d = days_between_inclusive(first_date, last_date)
+        else:
+            d = 0
+
+        # Build index entry
         index.append({
             "name": movie,
             "slug": slug,
-            "totalGross": total_gross,
-            "totalTickets": total_tickets
+            "totalTickets": total_tickets,
+            "totalShows": total_shows,
+            "totalSeats": total_seats,
+            "firstDate": first_date,
+            "lastDate": last_date,
+            "currentDate": today_yyyymmdd,
+            "d": d
         })
 
     # Write index file with last_updated
