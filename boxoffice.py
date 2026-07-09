@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Box Office Script – Fetches seat data for the current IST date only.
+Box Office Script – Fetches seat data for the current Bangladesh date only.
 Updates existing JSON file by matching programId (append/update).
 Saves to: /boxoffice/YYYY/MM-DD.json (minified, value-only arrays).
+
+Also builds/updates a movie‑level database:
+- movie/data/{slug}.json – day‑wise aggregated stats per movie
+- movie/index.json – master index of all movies with lifetime totals
 """
 
 import asyncio
@@ -11,7 +15,8 @@ import random
 import string
 import json
 import os
-from datetime import datetime, timezone, timedelta
+import re
+from datetime import datetime
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple, Any
 import pytz
@@ -22,13 +27,12 @@ SHOW_URL = "https://cineplex-web-api.cineplexbd.com/api/v1/movie-show-time"
 SEAT_URL = "https://cineplex-ticket-api.cineplexbd.com/api/v1/get-seat"
 
 SEAT_AUTH = "Bearer 175714|CINE-TICKET-1OgNEfYvrMNAQRnQwVUkiGVUhG88hh5dsE9AKbHM30ee001b"
-AVG_PRICE = 500  # not stored, but kept for potential future use
+AVG_PRICE = 500  # used for gross calculations
 
 LOCATIONS = [1, 2, 3, 4, 5, 6, 8, 9, 10]
 
-# Concurrency & performance
 MAX_CONCURRENT = 50
-RANDOM_DELAY_RANGE = (0.0, 0.0)   # set to (0.05, 0.2) if rate limits occur
+RANDOM_DELAY_RANGE = (0.0, 0.0)
 RETRIES = 2
 
 USER_AGENTS = [
@@ -37,8 +41,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 ]
 
-# Timezone: IST (UTC+5:30)
-IST = pytz.timezone("Asia/Kolkata")
+# Timezone: Bangladesh Standard Time (UTC+6)
+BST = pytz.timezone("Asia/Dhaka")
 
 # ========== HELPERS ==========
 def random_ua() -> str:
@@ -50,15 +54,21 @@ def generate_device_key(length: int = 64) -> str:
 def generate_user_id(length: int = 33) -> str:
     return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
-def ist_now() -> datetime:
-    return datetime.now(IST)
+def bst_now() -> datetime:
+    return datetime.now(BST)
 
-def get_ist_date_str() -> str:
-    return ist_now().strftime("%Y-%m-%d")
+def get_bst_date_str() -> str:
+    return bst_now().strftime("%Y-%m-%d")
 
-def get_ist_year_month_day() -> Tuple[str, str, str]:
-    now = ist_now()
+def get_bst_year_month_day() -> Tuple[str, str, str]:
+    now = bst_now()
     return now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
+
+def slugify(title: str) -> str:
+    """Generate a URL‑friendly slug from a movie title."""
+    slug = re.sub(r'[^a-zA-Z0-9\s]', '', title).strip().lower()
+    slug = re.sub(r'\s+', '-', slug)
+    return slug
 
 # Global device key (fixed per run)
 GLOBAL_DEVICE_KEY = generate_device_key()
@@ -161,18 +171,16 @@ async def fetch_seats(session: aiohttp.ClientSession, loc: int, pid: int,
 
 # ========== PROCESS DATE ==========
 async def process_date(session: aiohttp.ClientSession, show_auth: str,
-                       date_str: str, update_mode: bool = True) -> Dict[str, List[List[Any]]]:
+                       date_str: str) -> Dict[str, List[List[Any]]]:
     """
     Fetch all shows for the given date across all locations,
     then fetch seat data for each slot.
     Returns dict: {movie_title: [[programId, location, showTime, total, sold], ...]}
-    If update_mode is True, we will merge with existing file (for boxoffice).
     """
     # Gather shows from all locations
     show_tasks = [fetch_shows(session, show_auth, loc, date_str, date_str) for loc in LOCATIONS]
     show_results = await asyncio.gather(*show_tasks)
 
-    # Build list of seat-check tasks
     tasks = []
     for loc, show_data in zip(LOCATIONS, show_results):
         if not show_data:
@@ -180,17 +188,15 @@ async def process_date(session: aiohttp.ClientSession, show_auth: str,
         for movie in show_data["data"]:
             title = movie["movie_detail"]["title"]
             for day in movie["show_time"]:
-                # day["raw_date"] should equal date_str, but we trust it
                 for slot in day["slot"]:
                     pid = slot["schedule_id"]
-                    show_time = slot.get("time", "00:00:00")  # fallback
+                    show_time = slot.get("time", "00:00:00")
                     tasks.append((title, loc, pid, show_time))
 
     print(f"🎯 Total seat requests for {date_str}: {len(tasks)}")
     if not tasks:
         return {}
 
-    # Shuffle to randomise order
     random.shuffle(tasks)
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -208,7 +214,6 @@ async def process_date(session: aiohttp.ClientSession, show_auth: str,
     coros = [bounded_fetch(t, l, p, st) for (t, l, p, st) in tasks]
     results = await asyncio.gather(*coros, return_exceptions=True)
 
-    # Aggregate into movie->list of entries
     movie_data: Dict[str, List[List[Any]]] = defaultdict(list)
     for res in results:
         if isinstance(res, Exception) or res is None:
@@ -218,9 +223,9 @@ async def process_date(session: aiohttp.ClientSession, show_auth: str,
 
     return dict(movie_data)
 
-# ========== FILE I/O ==========
+# ========== DAILY FILE I/O ==========
 def get_boxoffice_filepath() -> str:
-    year, month, day = get_ist_year_month_day()
+    year, month, day = get_bst_year_month_day()
     dir_path = os.path.join("boxoffice", year)
     os.makedirs(dir_path, exist_ok=True)
     return os.path.join(dir_path, f"{month}-{day}.json")
@@ -238,26 +243,125 @@ def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
     """Merge new_data into existing file (update by programId)."""
     existing = load_existing_data(filepath)
 
-    # For each movie in new_data, merge into existing
     for movie, entries in new_data.items():
         if movie not in existing:
             existing[movie] = []
-        # Build a dict of existing entries by programId for fast lookup
         existing_map = {entry[0]: entry for entry in existing[movie]}
         for entry in entries:
             pid = entry[0]
-            existing_map[pid] = entry  # replace or add
+            existing_map[pid] = entry
         existing[movie] = list(existing_map.values())
 
-    # Write minified JSON
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(existing, f, separators=(',', ':'), ensure_ascii=False)
     print(f"💾 Updated {filepath}")
 
+# ========== MOVIE DATABASE BUILDER ==========
+def update_movie_database():
+    """
+    Scan all daily JSON files under boxoffice/, aggregate per movie per date,
+    and write per‑movie summary files + an index.
+    """
+    print("\n📊 Building movie database...")
+    base_dir = "boxoffice"
+    if not os.path.exists(base_dir):
+        print("⚠️ No boxoffice data found.")
+        return
+
+    # Collect all daily files: boxoffice/YYYY/MM-DD.json
+    daily_files = []
+    for year_dir in os.listdir(base_dir):
+        year_path = os.path.join(base_dir, year_dir)
+        if not os.path.isdir(year_path):
+            continue
+        for file in os.listdir(year_path):
+            if file.endswith(".json") and "-" in file:
+                # file name is MM-DD.json
+                month_day = file.replace(".json", "")
+                month, day = month_day.split("-")
+                date_str = f"{year_dir}{month}{day}"  # YYYYMMDD
+                daily_files.append((date_str, os.path.join(year_path, file)))
+
+    if not daily_files:
+        print("⚠️ No daily files found.")
+        return
+
+    # Aggregate: movie -> date -> stats
+    movie_agg: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {
+        "shows": 0,
+        "seats": 0,
+        "sold": 0,
+        "venues": set()   # will convert to count later
+    }))
+
+    for date_str, filepath in daily_files:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except:
+            continue
+        for movie, entries in data.items():
+            # entries: [[pid, loc, time, total, sold], ...]
+            shows = len(entries)
+            seats = sum(e[3] for e in entries)
+            sold = sum(e[4] for e in entries)
+            venues = {e[1] for e in entries}  # unique location ids
+
+            agg = movie_agg[movie][date_str]
+            agg["shows"] += shows
+            agg["seats"] += seats
+            agg["sold"] += sold
+            agg["venues"].update(venues)
+
+    # Now write per‑movie files and build index
+    os.makedirs("movie/data", exist_ok=True)
+    index = []
+
+    for movie, dates in movie_agg.items():
+        slug = slugify(movie)
+        # Prepare day‑wise rows: [date, totalGross, totalShows, totalSeats, totalVenues]
+        day_rows = []
+        total_gross = 0
+        total_tickets = 0
+
+        for date_str, stats in sorted(dates.items()):
+            gross = stats["sold"] * AVG_PRICE
+            total_gross += gross
+            total_tickets += stats["sold"]
+            venues_count = len(stats["venues"])
+            day_rows.append([
+                int(date_str),          # YYYYMMDD as int
+                gross,
+                stats["shows"],
+                stats["seats"],
+                venues_count
+            ])
+
+        # Write per‑movie file
+        movie_file = os.path.join("movie/data", f"{slug}.json")
+        with open(movie_file, "w", encoding="utf-8") as f:
+            json.dump(day_rows, f, separators=(',', ':'), ensure_ascii=False)
+        print(f"   📄 {movie_file}")
+
+        # Add to index
+        index.append({
+            "name": movie,
+            "slug": slug,
+            "totalGross": total_gross,
+            "totalTickets": total_tickets
+        })
+
+    # Write index file
+    index_file = os.path.join("movie", "index.json")
+    with open(index_file, "w", encoding="utf-8") as f:
+        json.dump(index, f, separators=(',', ':'), ensure_ascii=False)
+    print(f"💾 {index_file}")
+    print("✅ Movie database updated.\n")
+
 # ========== MAIN ==========
 async def main():
-    date_str = get_ist_date_str()
-    print(f"📅 Processing date: {date_str} (IST)")
+    date_str = get_bst_date_str()
+    print(f"📅 Processing date: {date_str} (Bangladesh Time)")
 
     async with aiohttp.ClientSession() as session:
         show_auth = await get_show_auth(session)
@@ -265,7 +369,7 @@ async def main():
             print("❌ Cannot continue without SHOW_AUTH")
             return
 
-        new_data = await process_date(session, show_auth, date_str, update_mode=True)
+        new_data = await process_date(session, show_auth, date_str)
 
         if not new_data:
             print("⚠️ No data fetched.")
@@ -273,6 +377,9 @@ async def main():
 
         filepath = get_boxoffice_filepath()
         merge_and_save(filepath, new_data)
+
+    # After updating daily file, rebuild the movie database
+    update_movie_database()
 
 if __name__ == "__main__":
     asyncio.run(main())
