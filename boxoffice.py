@@ -7,6 +7,8 @@ Saves to: /boxoffice/YYYY/MM-DD.json (minified, value-only arrays).
 Also builds/updates a movie‑level database:
 - movie/data/{slug}.json – day‑wise aggregated stats per movie
 - movie/index.json – master index of all movies with lifetime totals
+
+Each daily file and the index include a "last_updated" timestamp (IST).
 """
 
 import asyncio
@@ -41,8 +43,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 ]
 
-# Timezone: Bangladesh Standard Time (UTC+6)
+# Timezone: Bangladesh Standard Time (UTC+6) for date logic
 BST = pytz.timezone("Asia/Dhaka")
+# Indian Standard Time (UTC+5:30) for last_updated
+IST = pytz.timezone("Asia/Kolkata")
 
 # ========== HELPERS ==========
 def random_ua() -> str:
@@ -63,6 +67,13 @@ def get_bst_date_str() -> str:
 def get_bst_year_month_day() -> Tuple[str, str, str]:
     now = bst_now()
     return now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
+
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+def get_ist_timestamp() -> str:
+    """Return current IST time as 'YYYY-MM-DD HH:MM IST'."""
+    return ist_now().strftime("%Y-%m-%d %H:%M IST")
 
 def slugify(title: str) -> str:
     """Generate a URL‑friendly slug from a movie title."""
@@ -231,18 +242,27 @@ def get_boxoffice_filepath() -> str:
     return os.path.join(dir_path, f"{month}-{day}.json")
 
 def load_existing_data(filepath: str) -> Dict[str, List[List[Any]]]:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+    """Load the data portion from a daily JSON file.
+       Handles both new (with 'data' key) and old (direct dict) formats."""
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = json.load(f)
+        # If it's a dict with a "data" key, extract it
+        if isinstance(content, dict) and "data" in content:
+            return content["data"]
+        # Otherwise assume it's the old format (direct movie->entries)
+        return content
+    except:
+        return {}
 
 def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
-    """Merge new_data into existing file (update by programId)."""
+    """Merge new_data into existing file (update by programId),
+       then save with a top-level "data" and "last_updated" (IST)."""
     existing = load_existing_data(filepath)
 
+    # Merge new_data into existing
     for movie, entries in new_data.items():
         if movie not in existing:
             existing[movie] = []
@@ -252,15 +272,22 @@ def merge_and_save(filepath: str, new_data: Dict[str, List[List[Any]]]):
             existing_map[pid] = entry
         existing[movie] = list(existing_map.values())
 
+    # Build the final structure with timestamp
+    output = {
+        "data": existing,
+        "last_updated": get_ist_timestamp()
+    }
+
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(existing, f, separators=(',', ':'), ensure_ascii=False)
-    print(f"💾 Updated {filepath}")
+        json.dump(output, f, separators=(',', ':'), ensure_ascii=False)
+    print(f"💾 Updated {filepath} (last_updated: {output['last_updated']})")
 
 # ========== MOVIE DATABASE BUILDER ==========
 def update_movie_database():
     """
     Scan all daily JSON files under boxoffice/, aggregate per movie per date,
     and write per‑movie summary files + an index.
+    The index now includes a "last_updated" field.
     """
     print("\n📊 Building movie database...")
     base_dir = "boxoffice"
@@ -276,7 +303,6 @@ def update_movie_database():
             continue
         for file in os.listdir(year_path):
             if file.endswith(".json") and "-" in file:
-                # file name is MM-DD.json
                 month_day = file.replace(".json", "")
                 month, day = month_day.split("-")
                 date_str = f"{year_dir}{month}{day}"  # YYYYMMDD
@@ -297,15 +323,19 @@ def update_movie_database():
     for date_str, filepath in daily_files:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                content = json.load(f)
+            # Extract data: new format has "data" key; old is direct
+            if isinstance(content, dict) and "data" in content:
+                data = content["data"]
+            else:
+                data = content
         except:
             continue
         for movie, entries in data.items():
-            # entries: [[pid, loc, time, total, sold], ...]
             shows = len(entries)
             seats = sum(e[3] for e in entries)
             sold = sum(e[4] for e in entries)
-            venues = {e[1] for e in entries}  # unique location ids
+            venues = {e[1] for e in entries}
 
             agg = movie_agg[movie][date_str]
             agg["shows"] += shows
@@ -319,7 +349,6 @@ def update_movie_database():
 
     for movie, dates in movie_agg.items():
         slug = slugify(movie)
-        # Prepare day‑wise rows: [date, totalGross, totalShows, totalSeats, totalVenues]
         day_rows = []
         total_gross = 0
         total_tickets = 0
@@ -330,7 +359,7 @@ def update_movie_database():
             total_tickets += stats["sold"]
             venues_count = len(stats["venues"])
             day_rows.append([
-                int(date_str),          # YYYYMMDD as int
+                int(date_str),
                 gross,
                 stats["shows"],
                 stats["seats"],
@@ -343,7 +372,6 @@ def update_movie_database():
             json.dump(day_rows, f, separators=(',', ':'), ensure_ascii=False)
         print(f"   📄 {movie_file}")
 
-        # Add to index
         index.append({
             "name": movie,
             "slug": slug,
@@ -351,11 +379,15 @@ def update_movie_database():
             "totalTickets": total_tickets
         })
 
-    # Write index file
+    # Write index file with last_updated
     index_file = os.path.join("movie", "index.json")
+    output_index = {
+        "movies": index,
+        "last_updated": get_ist_timestamp()
+    }
     with open(index_file, "w", encoding="utf-8") as f:
-        json.dump(index, f, separators=(',', ':'), ensure_ascii=False)
-    print(f"💾 {index_file}")
+        json.dump(output_index, f, separators=(',', ':'), ensure_ascii=False)
+    print(f"💾 {index_file} (last_updated: {output_index['last_updated']})")
     print("✅ Movie database updated.\n")
 
 # ========== MAIN ==========
